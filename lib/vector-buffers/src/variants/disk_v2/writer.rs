@@ -318,6 +318,9 @@ pub(super) struct FlushResult {
 
 /// Wraps an [`AsyncWrite`] value and buffers individual writes, while signalling implicit flushes.
 ///
+/// Complete the underlying flush before reporting progress: Tokio files can accept
+/// a write before its bytes are readable.
+///
 /// As the [`BufferWriter`] must track when writes have theoretically made it to disk, we care about
 /// situations where the internal write buffer for a data file has been flushed to make room.  In
 /// order to provide this information, we track the number of events represented by a record when
@@ -375,6 +378,7 @@ impl<W: AsyncWrite + Unpin> TrackingBufWriter<W> {
         // If the given buffer is too large to be buffered at all, then bypass the internal buffer.
         if buf.len() >= self.buf.capacity() {
             self.inner.write_all(buf).await?;
+            self.inner.flush().await?;
 
             let flush_result = flush_result.get_or_insert(FlushResult::default());
             flush_result.events_flushed += event_count as u64;
@@ -412,12 +416,12 @@ impl<W: AsyncWrite + Unpin> TrackingBufWriter<W> {
         self.unflushed_events = 0;
         self.buf.clear();
 
-        result.map(|()| {
-            Some(FlushResult {
-                events_flushed,
-                bytes_flushed,
-            })
-        })
+        result?;
+        self.inner.flush().await?;
+        Ok(Some(FlushResult {
+            events_flushed,
+            bytes_flushed,
+        }))
     }
 
     /// Gets a reference to the underlying writer.
@@ -1989,5 +1993,172 @@ where
 {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+mod flush_completion_tests {
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        task::{Context, Poll, Waker},
+    };
+
+    use super::*;
+
+    #[test]
+    fn tokio_file_write_completion_precedes_progress() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        for capacity in [1, 1024] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let inner = tokio::fs::File::from_std(file.reopen().unwrap());
+            let mut writer = TrackingBufWriter::with_capacity(capacity, inner);
+            runtime.block_on(async {
+                // Keep Tokio's only blocking thread busy so file writes cannot
+                // finish until we explicitly release it.
+                let (started, ready) = tokio::sync::oneshot::channel();
+                let (release, wait) = std::sync::mpsc::channel::<()>();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    started.send(()).unwrap();
+                    assert!(wait.recv().is_err());
+                });
+                ready.await.unwrap();
+                let mut operation = Box::pin(async {
+                    let implicit = writer.write(3, b"payload").await?;
+                    let explicit = writer.flush().await?;
+                    Ok::<_, io::Error>(implicit.or(explicit))
+                });
+                let mut cx = Context::from_waker(Waker::noop());
+                let pending = operation.as_mut().poll(&mut cx).is_pending();
+                // Release before asserting so a failing regression cannot hang
+                // runtime shutdown while joining the blocking thread.
+                drop(release);
+                blocker.await.unwrap();
+                assert!(pending, "reported progress before the file write completed");
+                assert_eq!(
+                    operation.await.unwrap(),
+                    Some(FlushResult {
+                        events_flushed: 3,
+                        bytes_flushed: 7,
+                    })
+                );
+                assert_eq!(std::fs::read(file.path()).unwrap(), b"payload");
+            });
+        }
+    }
+
+    // Model an async file: accepting bytes does not make them readable until flush completes.
+    struct DeferredWriter {
+        ready: Arc<AtomicBool>,
+        pending: Vec<u8>,
+        readable: Vec<u8>,
+        write_error: bool,
+        flush_error: bool,
+    }
+
+    impl AsyncWrite for DeferredWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.write_error {
+                return Poll::Ready(Err(io::Error::other("write failed")));
+            }
+            self.pending.extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.flush_error {
+                return Poll::Ready(Err(io::Error::other("flush failed")));
+            }
+            if !self.ready.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
+            let pending = std::mem::take(&mut self.pending);
+            self.readable.extend(pending);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    fn writer(
+        capacity: usize,
+        write_error: bool,
+        flush_error: bool,
+    ) -> TrackingBufWriter<DeferredWriter> {
+        TrackingBufWriter::with_capacity(
+            capacity,
+            DeferredWriter {
+                ready: Arc::new(AtomicBool::new(false)),
+                pending: Vec::new(),
+                readable: Vec::new(),
+                write_error,
+                flush_error,
+            },
+        )
+    }
+
+    #[test]
+    fn flush_completion_precedes_progress() {
+        // Cover explicit buffered flush and implicit/direct write flush.
+        for capacity in [1, 1024] {
+            let mut writer = writer(capacity, false, false);
+            let ready = writer.get_ref().ready.clone();
+            let mut operation = Box::pin(async {
+                let implicit = writer.write(3, b"payload").await?;
+                let explicit = writer.flush().await?;
+                Ok::<_, io::Error>(implicit.or(explicit))
+            });
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(operation.as_mut().poll(&mut cx).is_pending());
+            ready.store(true, Ordering::SeqCst);
+            assert!(matches!(
+                operation.as_mut().poll(&mut cx),
+                Poll::Ready(Ok(Some(FlushResult {
+                    events_flushed: 3,
+                    bytes_flushed: 7,
+                })))
+            ));
+            drop(operation);
+            assert_eq!(writer.get_ref().readable, b"payload");
+            assert!(writer.get_ref().pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn flush_completion_errors_are_returned() {
+        for capacity in [1, 1024] {
+            for write_error in [true, false] {
+                let mut writer = writer(capacity, write_error, !write_error);
+                let mut operation = Box::pin(async {
+                    writer.write(3, b"payload").await?;
+                    writer.flush().await
+                });
+                let mut cx = Context::from_waker(Waker::noop());
+                let Poll::Ready(Err(error)) = operation.as_mut().poll(&mut cx) else {
+                    panic!("failed writes must not report flushed progress");
+                };
+                assert_eq!(
+                    error.to_string(),
+                    if write_error {
+                        "write failed"
+                    } else {
+                        "flush failed"
+                    }
+                );
+            }
+        }
     }
 }
